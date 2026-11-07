@@ -9,21 +9,55 @@
     What it does:
       1. creates <StoreDir>\voxcut-release.jks (RSA 4096, ~30 years)
       2. writes keystore.properties at the repository root (git-ignored)
-      3. prints the gradle command that builds the signed APK
+      3. builds app-release.apk and prints its sha256
 
     Keep both the keystore and the password. Lose either and you can never
     ship an update that installs over an already released build.
 #>
 [CmdletBinding()]
 param(
-    [string]$StoreDir = (Join-Path $env:USERPROFILE '.voxcut'),
-    [string]$Alias    = 'voxcut',
-    [string]$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+    [string]$StoreDir,
+    [string]$Alias = 'voxcut',
+    [string]$RepoRoot
 )
 
 $ErrorActionPreference = 'Stop'
 
+# $PSScriptRoot is not populated while param defaults are evaluated under
+# Windows PowerShell 5.1, so every path is resolved here instead.
+$scriptPath = $MyInvocation.MyCommand.Path
+$scriptRoot = if ($PSScriptRoot) { $PSScriptRoot }
+              elseif ($scriptPath) { Split-Path -Parent $scriptPath }
+              else { (Get-Location).Path }
+
+if (-not $StoreDir) { $StoreDir = Join-Path $env:USERPROFILE '.voxcut' }
+if (-not $RepoRoot) { $RepoRoot = (Resolve-Path (Join-Path $scriptRoot '..')).Path }
+
+function Find-Tool {
+    param([string]$Name)
+
+    $cmd = Get-Command $Name -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+
+    $roots = @(
+        (Join-Path $env:ProgramFiles 'Java'),
+        (Join-Path $env:ProgramFiles 'Eclipse Adoptium'),
+        (Join-Path $env:ProgramFiles 'Microsoft'),
+        (Join-Path $env:ProgramFiles 'Android\Android Studio\jbr'),
+        'E:\game\rea-tools'
+    )
+    foreach ($root in $roots) {
+        if (-not (Test-Path $root)) { continue }
+        $hit = Get-ChildItem -Path $root -Filter $Name -Recurse -Depth 3 -ErrorAction SilentlyContinue |
+               Select-Object -First 1
+        if ($hit) { return $hit.FullName }
+    }
+    return $null
+}
+
 $storePath = Join-Path $StoreDir 'voxcut-release.jks'
+$propsPath = Join-Path $RepoRoot 'keystore.properties'
+
 if (-not (Test-Path $StoreDir)) { New-Item -ItemType Directory -Force -Path $StoreDir | Out-Null }
 
 if (Test-Path $storePath) {
@@ -35,8 +69,9 @@ if (Test-Path $storePath) {
         [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
     if ([string]::IsNullOrWhiteSpace($plain)) { throw 'password must not be empty' }
 
-    $keytool = (Get-Command keytool -ErrorAction SilentlyContinue).Source
-    if (-not $keytool) { throw 'keytool not found - put your JDK bin directory on PATH first' }
+    $keytool = Find-Tool -Name 'keytool.exe'
+    if (-not $keytool) { throw 'keytool.exe not found - install a JDK 17+ or put its bin directory on PATH' }
+    Write-Host "[i] keytool: $keytool"
 
     & $keytool -genkeypair -v `
         -keystore $storePath `
@@ -48,7 +83,6 @@ if (Test-Path $storePath) {
 
     # Java .properties treats backslash as an escape character, so the path
     # written here must use forward slashes or C:\Users becomes C:Users.
-    $propsPath = Join-Path $RepoRoot 'keystore.properties'
     @(
         "storeFile=$($storePath -replace '\\','/')"
         "storePassword=$plain"
@@ -56,13 +90,38 @@ if (Test-Path $storePath) {
         "keyPassword=$plain"
     ) | Set-Content -Path $propsPath -Encoding ASCII
 
-    Write-Host "[+] wrote $propsPath" -ForegroundColor Green
     Write-Host "[+] keystore: $storePath" -ForegroundColor Green
+    Write-Host "[+] wrote   : $propsPath" -ForegroundColor Green
 }
 
+if (-not $env:JAVA_HOME) {
+    $java = Find-Tool -Name 'java.exe'
+    if ($java) {
+        $env:JAVA_HOME = Split-Path (Split-Path $java -Parent) -Parent
+        Write-Host "[i] JAVA_HOME=$env:JAVA_HOME"
+    }
+}
+
+$gradlew = Join-Path $RepoRoot 'gradlew.bat'
 Write-Host ''
-Write-Host 'Next:'
-Write-Host "  cd `"$RepoRoot`""
-Write-Host '  .\gradlew assembleRelease'
+Write-Host 'Building the signed release...'
+Push-Location $RepoRoot
+try {
+    & $gradlew assembleRelease --no-daemon --console=plain
+    if ($LASTEXITCODE -ne 0) { throw "gradlew exited with $LASTEXITCODE" }
+} finally {
+    Pop-Location
+}
+
+$apk = Join-Path $RepoRoot 'app\build\outputs\apk\release\app-release.apk'
+if (-not (Test-Path $apk)) {
+    Write-Host "[!] $apk not found - check the gradle output above" -ForegroundColor Red
+    exit 1
+}
+
+$hash = (Get-FileHash -Algorithm SHA256 -Path $apk).Hash.ToLower()
 Write-Host ''
-Write-Host 'Signed package lands in app\build\outputs\apk\release\app-release.apk'
+Write-Host "[+] signed package: $apk" -ForegroundColor Green
+Write-Host "[+] sha256        : $hash" -ForegroundColor Green
+Write-Host ''
+Write-Host 'Send that path back to the agent and it will tag v1.0.0 and publish the release.'
