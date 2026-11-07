@@ -39,20 +39,26 @@ function Find-Tool {
     $cmd = Get-Command $Name -ErrorAction SilentlyContinue
     if ($cmd) { return $cmd.Source }
 
+    # Common JDK locations; add your own if the JDK lives elsewhere.
     $roots = @(
-        (Join-Path $env:ProgramFiles 'Java'),
+        'E:\game\rea-tools',
         (Join-Path $env:ProgramFiles 'Eclipse Adoptium'),
+        (Join-Path $env:ProgramFiles 'Java'),
         (Join-Path $env:ProgramFiles 'Microsoft'),
-        (Join-Path $env:ProgramFiles 'Android\Android Studio\jbr'),
-        'E:\game\rea-tools'
+        (Join-Path $env:ProgramFiles 'Android\Android Studio\jbr')
     )
-    foreach ($root in $roots) {
-        if (-not (Test-Path $root)) { continue }
-        $hit = Get-ChildItem -Path $root -Filter $Name -Recurse -Depth 3 -ErrorAction SilentlyContinue |
-               Select-Object -First 1
-        if ($hit) { return $hit.FullName }
+    $hits = foreach ($root in $roots) {
+        if (Test-Path $root) {
+            Get-ChildItem -Path $root -Filter $Name -Recurse -Depth 3 -ErrorAction SilentlyContinue
+        }
     }
-    return $null
+    if (-not $hits) { return $null }
+    # JDK 17's trust store can reject services.gradle.org behind a TLS proxy;
+    # prefer a JDK 21+ when the environment pins nothing.
+    $preferred = $hits | Where-Object { $_.FullName -match 'jdk-2[1-9]|jdk-[3-9][0-9]' } |
+                 Select-Object -First 1
+    if ($preferred) { return $preferred.FullName }
+    return ($hits | Select-Object -First 1).FullName
 }
 
 $storePath = Join-Path $StoreDir 'voxcut-release.jks'
@@ -94,11 +100,15 @@ if (Test-Path $storePath) {
     Write-Host "[+] wrote   : $propsPath" -ForegroundColor Green
 }
 
-if (-not $env:JAVA_HOME) {
+$javaHome = $env:JAVA_HOME
+if ($javaHome -and (Test-Path (Join-Path $javaHome 'bin\java.exe'))) {
+    Write-Host "[i] JAVA_HOME=$javaHome (environment)"
+} else {
     $java = Find-Tool -Name 'java.exe'
     if ($java) {
-        $env:JAVA_HOME = Split-Path (Split-Path $java -Parent) -Parent
-        Write-Host "[i] JAVA_HOME=$env:JAVA_HOME"
+        $javaHome = Split-Path (Split-Path $java -Parent) -Parent
+        $env:JAVA_HOME = $javaHome
+        Write-Host "[i] JAVA_HOME=$javaHome"
     }
 }
 
